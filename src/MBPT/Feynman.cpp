@@ -781,13 +781,13 @@ GMatrix Feynman::Sigma_direct(int kv, double env,
   constexpr std::complex<double> I{0.0, 1.0};
   const auto num_kappas = std::size_t(m_max_ki + 1);
 
-// Tell OpenMP how to reduce GMatrix
-#pragma omp declare reduction(+ : GMatrix : omp_out += omp_in)                 \
-    initializer(omp_priv = GMatrix(omp_orig))
 
 #pragma omp parallel for collapse(2) reduction(+ : Sigma)
   for (auto iw = 0ul; iw < m_wgrid.num_points(); iw++) {
-    for (auto iB = 0ul; iB < num_kappas; ++iB) {
+    for (auto iB = 0ul; iB < num_kappas; ++iB) {// Tell OpenMP how to reduce GMatrix
+#pragma omp declare reduction(+ : GMatrix : omp_out += omp_in)                 \
+    initializer(omp_priv = GMatrix(omp_orig))
+
 
       const auto omega = std::complex{m_omre, m_wgrid(iw)};
 
@@ -828,5 +828,254 @@ GMatrix Feynman::Sigma_direct(int kv, double env,
 
   return Sigma;
 }
+//==============================================================
+//===============NEW STUFF======================================
+//==============================================================
+ComplexGMatrix Feynman::Gamma_k_ir(int k, float ir, std::complex<double> omega,
+                                        bool hole_particle) const {
+
+    // Exchange operator is Gamma ~ Fa^†Fa * Gex_12(ea + w) + Gex_[23](ea - w)]* Fa^†Fa 
+    // Gamma = Gamma(r1, r2, r3) r2 is an argument to this function so its only a matrix.
+    ComplexGMatrix Gma_k_ir(m_i0, m_stride, m_subgrid_points, m_grid);
+    const auto Iunit = std::complex<double>{0.0, 1.0};
+    const auto &core = m_HF->core();
+    for (auto ia = 0ul; ia < core.size(); ++ia) {
+      const auto &Fa = core[ia];
+      if (Fa.n() < m_min_core_n)
+        continue;
+
+      const auto ea_minus_w = std::complex<double>{Fa.en()} - omega;
+      const auto ea_plus_w = std::complex<double>{Fa.en()} + omega;
+
+      // not m_hole_particle, as need both for "screen only"
+      const auto *Fa_hp = hole_particle ? &Fa : nullptr;
+
+      for (int in = 0; in <= m_max_ki; ++in) {
+        const auto kn = Angular::kappaFromIndex(in);
+        const auto ck_an = Angular::Ck_kk(k, Fa.kappa(), kn);
+        if (ck_an == 0.0)
+          continue;
+        const double c_ang = ck_an * ck_an / double(2 * k + 1);
+
+        ComplexGMatrix Gx_m = green_excited(kn, ea_minus_w, Fa_hp)
+        ComplexGMaitrx Gx_p = green_excited(kn, ea_plus_w, Fa_hp);
+
+        // loop over coordinate indices.
+        // pi is symmetric in r1, r2 so is there more efficient way to do this
+        // so that I don't loop over all ri, rj?
+        // pi ~ Fa^†(r1)[Gex(r1,r2,ea-w) + Gex(r1,r2,ea+w)]Fa(r2)
+        ri0 = Gx_pm.index_to_fullgrid(ir);
+        for (auto i = 0ul; i < m_subgrid_points; ++i) {
+          const auto ri = Gx_pm.index_to_fullgrid(i);
+          for (auto j = 0ul; j < m_subgrid_points; ++j) {
+            const auto rj = Gx_pm.index_to_fullgrid(j);
+
+            const auto Pa_12_ff = Fa.f(ri)*Fa.f(ri0);
+            const auto Pa_12_fg = Fa.f(ri)*Fa.g(ri0);
+            const auto Pa_12_gf = Fa.g(ri)*Fa.f(ri0);
+            const auto Pa_12_gg = Fa.g(ri)*Fa.g(ri0);
+
+            const auto Pa_23_ff = Fa.f(ri0)*Fa.f(rj);
+            const auto Pa_23_fg = Fa.f(ri0)*Fa.g(rj);
+            const auto Pa_23_gf = Fa.g(ri0)*Fa.f(rj);
+            const auto Pa_23_gg = Fa.g(ri0)*Fa.g(rj);
+
+            Gma_k_ri.ff(i, j) += c_ang * (Pa_12_ff*Gx_p.ff(ir, j) + Pa_12_fg*Gx_p.gf(ir, j) + 
+                                          Gx_m.ff(i, ir)*Pa_23_ff + Gx_m.fg(i, ir)*Pa_23_gf);
+
+            Gma_k_ri.fg(i, j) += c_ang * (Pa_12_ff*Gx_p.fg(ir, j) + Pa_12_fg*Gx_p.gg(ir, j) + 
+                                          Gx_m.ff(i, ir)*Pa_23_fg + Gx_m.fg(i, ir)*Pa_23_gg);
+
+            Gma_k_ri.gf(i, j) += c_ang * (Pa_12_gf*Gx_p.ff(ir, j) + Pa_12_gg*Gx_p.gf(ir, j) +
+                                          Gx_m.gf(i, ir)*Pa_23_ff + Gx_m.gg(i, ir)*Pa_23_gf);
+
+            Gma_k_ri.gg(i, j) += c_ang * (Pa_12_gf*Gx_p.fg(ir, j) + Pa_12_gg*Gx_p.gg(ir, j) + 
+                                          Gx_m.gf(i, ir)*Pa_23_fg + Gx_m.gg(i, ir)*Pa_23_gg);
+
+          }
+        }
+      }
+    }
+
+    // // Can we use the symmetry to reduce calculations??
+    // for (auto i = 0ul; i < m_subgrid_points; ++i) {
+    //   for (auto j = 0ul; j <= i; ++j) {
+    //     pi_k(j, i) = pi_k(i, j);
+    //   }
+    // }
+
+    Gma_k_ri *= Iunit;
+    return Gma_k_ri;
+}
+
+
+void Feynman::form_qpiq() {
+  std::cout << "Forming QPQ(w,k)";
+  if (m_hole_particle || m_screen_Coulomb) {
+    std::cout << " (w/ " << (m_screen_Coulomb ? "scr" : "")
+              << (m_hole_particle && m_screen_Coulomb ? " + " : "")
+              << (m_hole_particle ? "hp" : "") << ")";
+  }
+  std::cout << " .. " << std::flush;
+
+  const auto num_ks = std::size_t(m_max_k + 1);
+  const auto num_ws = m_wgrid.num_points();
+
+  m_qpiq_wk.resize(num_ws, num_ks,
+                   ComplexRMatrix{m_i0, m_stride, m_subgrid_points, m_grid});
+
+#pragma omp parallel for collapse(2)
+  for (auto iw = 0ul; iw < num_ws; ++iw) {
+    for (auto k = 0ul; k < num_ks; ++k) {
+      const auto omega = std::complex<double>{m_omre, m_wgrid.r(iw)};
+
+      const auto &q = get_qk(int(k)); // has drj
+      const auto qdri = q.dri();      // has drj, and dri
+      const auto pi = polarisation_k(int(k), omega, m_hole_particle);
+
+      if (m_screen_Coulomb) {
+        const auto X = X_screen(pi, qdri);
+        m_qpiq_wk[iw][k] = q * pi * X * qdri;
+      } else {
+        m_qpiq_wk[iw][k] = q * pi * qdri;
+      }
+    }
+  }
+
+  std::cout << " done\n" << std::flush;
+}
+
+// Have to edit the body of this function
+GMatrix Feynman::Sigma_exchange(int kv, double env,
+                                std::optional<int> in_k) const {
+    // If in_k is set, only calculate for single k
+    // Used both for testing, and for calculating f_k factors
+
+    GMatrix Sigma(m_i0, m_stride, m_subgrid_points, m_include_G, m_grid);
+
+    constexpr std::complex<double> I{0.0, 1.0};
+    const auto num_kappas = std::size_t(m_max_ki + 1);
+
+  // Tell OpenMP how to reduce GMatrix -
+  #pragma omp declare reduction(+ : GMatrix : omp_out += omp_in)                 
+      initializer(omp_priv = GMatrix(omp_orig))
+
+  #pragma omp parallel for collapse(2) reduction(+ : Sigma)
+    for (auto iw = 0ul; iw < m_wgrid.num_points(); iw++) {
+      for (auto iB = 0ul; iB < num_kappas; ++iB) {
+
+        const auto omega = std::complex{m_omre, m_wgrid(iw)};
+
+        // Simpson's rule: Implicit ends (integrand zero at w=0 and w>wmax)
+        const auto weight = iw % 2 == 0 ? 4.0 / 3 : 2.0 / 3;
+
+        // I, since dw is on imag. grid; 2 from symmetric +/- w
+        const auto dw = I * weight * m_wgrid.drdu(iw);
+
+        const auto kB = Angular::kappaFromIndex(int(iB));
+
+        // Silly, but ig gB includes G, then so will gB_QPQ
+        const auto gB = m_include_G ? green(kB, env + omega) :
+                                      green(kB, env + omega).drop_g();
+
+        for (auto k = 0ul; int(k) <= m_max_k; k++) {
+
+          // For doing single k (tests and for fk factors)
+          if (in_k && *in_k != int(k))
+            continue;
+
+          const auto ck_vB = Angular::Ck_kk(int(k), kv, kB);
+          if (ck_vB == 0.0)
+            continue;
+
+          const auto &qpq_dw = m_qpiq_wk[iw][k];
+
+          const auto c_ang_dw =
+              dw * ck_vB * ck_vB / double(Angular::twoj_k(kv) + 1);
+
+          Sigma += (c_ang_dw * mult_elements(gB, qpq_dw)).real();
+        }
+      }
+    }
+
+    // Extra 2 from symmetric + / -w
+    Sigma *= (m_wgrid.du() / M_PI);
+
+    return Sigma;
+}
+
+
+// Have to edit the body of this function
+GMatrix Feynman::Sigma_exchange2(int kv, double env,
+                                std::optional<int> in_k) const {
+    // If in_k is set, only calculate for single k
+    // Used both for testing, and for calculating f_k factors
+
+    GMatrix Sigma(m_i0, m_stride, m_subgrid_points, m_include_G, m_grid);
+
+
+    ComplexGMatrix G = green(kB, env + omega);
+    constexpr std::complex<double> I{0.0, 1.0};
+    const auto num_kappas = std::size_t(m_max_ki + 1);
+            
+  // Gma_[1ij]Q_[1i]G_[j2]Q_[j2]
+  for (auto ir = 0ul; ir < m_subgrid_points; ir++){
+    const auto ri = Gx_pm.index_to_fullgrid(i);
+    Gm_i = Gamma_k_ri(ir, int(k), omega, m_hole_particle); 
+    Sigma(i,j) =   
+  }
+
+
+
+  // Tell OpenMP how to reduce GMatrix -
+  #pragma omp declare reduction(+ : GMatrix : omp_out += omp_in)                 \
+      initializer(omp_priv = GMatrix(omp_orig))
+
+  #pragma omp parallel for collapse(2) reduction(+ : Sigma)
+    for (auto iw = 0ul; iw < m_wgrid.num_points(); iw++) {
+      for (auto iB = 0ul; iB < num_kappas; ++iB) {
+
+        const auto omega = std::complex{m_omre, m_wgrid(iw)};
+
+        // Simpson's rule: Implicit ends (integrand zero at w=0 and w>wmax)
+        const auto weight = iw % 2 == 0 ? 4.0 / 3 : 2.0 / 3;
+
+        // I, since dw is on imag. grid; 2 from symmetric +/- w
+        const auto dw = I * weight * m_wgrid.drdu(iw);
+
+        const auto kB = Angular::kappaFromIndex(int(iB));
+
+        // Silly, but ig gB includes G, then so will gB_QPQ
+        const auto gB = m_include_G ? green(kB, env + omega) :
+                                      green(kB, env + omega).drop_g();
+
+        for (auto k = 0ul; int(k) <= m_max_k; k++) {
+
+          // For doing single k (tests and for fk factors)
+          if (in_k && *in_k != int(k))
+            continue;
+
+          const auto ck_vB = Angular::Ck_kk(int(k), kv, kB);
+          if (ck_vB == 0.0)
+            continue;
+
+          const auto &qpq_dw = m_qpiq_wk[iw][k];
+
+          const auto c_ang_dw =
+              dw * ck_vB * ck_vB / double(Angular::twoj_k(kv) + 1);
+
+          Sigma += (c_ang_dw * mult_elements(gB, qpq_dw)).real();
+        }
+      }
+    }
+
+    // Extra 2 from symmetric + / -w
+    Sigma *= (m_wgrid.du() / M_PI);
+
+    return Sigma;
+}
+
+
+
 
 } // namespace MBPT
